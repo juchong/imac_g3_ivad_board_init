@@ -1,0 +1,10 @@
+# clang-format configuration for Arduino/C++ projects
+BasedOnStyle: LLVM
+IndentWidth: 2
+BinPackArguments: false
+BinPackParameters: false
+IndentCaseLabels: true
+ColumnLimit: 0
+AllowShortFunctionsOnASingleLine: Empty
+BreakBeforeBraces: Allman
+PointerAlignment: Left
