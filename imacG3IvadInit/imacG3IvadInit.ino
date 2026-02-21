@@ -1,417 +1,433 @@
+/*
+   iMac G3 IVAD Board Init — Arduino Uno/Nano firmware
+   Original code by Rocky Hill (qbancoffee)
 
-/**
- * @file imacG3IvadInit.ino
- * @brief iMac G3 IVAD Board Initialization Controller
- *
- * This firmware controls the iMac G3's IVAD (Integrated Video Adapter) board,
- * enabling the CRT display to be used as a standard VGA monitor. It handles:
- * - Power sequencing via solid-state relay
- * - I2C communication with IVAD board for initialization and settings
- * - EDID data simulation for connected computers
- * - Serial protocol for computer control (oshimai's protocol)
- * - VSYNC monitoring for automatic power-off
- *
- * Required Libraries:
- * - EEPROMWearLevel: https://github.com/PRosenb/EEPROMWearLevel
- * - SoftwareWire: https://github.com/Testato/SoftwareWire
- *
- * Hardware Requirements:
- * - Arduino Nano/Uno
- * - Solid-state relay on pin 7 for CRT power control
- * - Button on pin 3 for manual power toggle
- * - VSYNC input on pin 10 for signal detection
- * - Software I2C on pins 4 (SDA) and 5 (SCL) for IVAD communication
- * - Hardware I2C slave on 0x50 for EDID responses
- *
- * Supported Resolutions (from EDID):
- * - 1024x768 @ 75 Hz
- * - 800x600 @ 95 Hz
- * - 640x480 @ 117 Hz
- *
- * Required Modifications to Arduino Wire Library:
- * - BUFFER_LENGTH: 32 -> 128 in Wire.h
- * - TWI_BUFFER_LENGTH: 32 -> 128 in twi.h
- *
- * @author Rocky Hill
- * @see https://github.com/qbancoffee/imac_g3_ivad_board_init
- */
+   Controls the iMac G3 slot-loading CRT via its IVAD board over I2C,
+   allowing the CRT to be used as a standalone VGA monitor.
 
-#include "imacG3IvadInit.h"
+   Features:
+   - Initializes the IVAD board via SoftwareWire (I2C master on pins 4/5)
+   - Responds to EDID requests as an I2C slave (Wire library on A4/A5,
+     address 0x50) so the video source can identify the display
+   - Persists display geometry/color settings in EEPROM with wear leveling
+   - Serial console (115200 baud) for adjusting all display settings,
+     power control, and diagnostics (send '?' for command list)
+   - Auto power-on when VSYNC is detected (optional, saved to EEPROM)
+   - Auto power-off after 180 seconds of VSYNC signal loss
+   - Physical power button on pin 3
+
+   Supported display modes (from EDID):
+     1024x768 @ 75 Hz
+     800x600 @ 95 Hz
+     640x480 @ 117 Hz
+
+   IMPORTANT: When using an HDMI-to-VGA adapter, the adapter typically
+   has its own EDID and does not pass through the Arduino's EDID. You
+   must manually force a compatible resolution (1024x768 @ 75 Hz) on
+   the host. Native VGA sources read the Arduino's EDID directly.
+
+   Wire library modification required:
+     Change BUFFER_LENGTH to 128 in:
+       arduino_install_folder/hardware/arduino/avr/libraries/Wire/src/Wire.h
+     Change TWI_BUFFER_LENGTH to 128 in:
+       arduino_install_folder/hardware/arduino/avr/libraries/Wire/src/utility/twi.h
+
+   Pin assignments:
+     D3       - Power button (active LOW)
+     D4       - IVAD SDA (SoftwareWire)
+     D5       - IVAD SCL (SoftwareWire)
+     D7       - Solid-state relay control
+     D10      - VSYNC input from VGA
+     A4 (SDA) - VGA DDC data  (pin 12 on VGA connector)
+     A5 (SCL) - VGA DDC clock (pin 15 on VGA connector)
+     PD0/PD1  - Hardware serial (TX/RX) at 115200 baud
+
+   Libraries:
+     SoftwareWire - https://github.com/Testato/SoftwareWire
+     EEPROMWearLevel - https://github.com/PRosenb/EEPROMWearLevel
+*/
+
 #include "ivad.h"
+#include "imacG3IvadInit.h"
 #include <EEPROMWearLevel.h>
 #include <SoftwareWire.h>
 #include <Wire.h>
 
-// =============================================================================
-// GLOBAL VARIABLES
-// =============================================================================
 
-// Starting monitor property values (debug display only - not actively used)
-// These appear to be initial/default values for reference
-// Actual values are stored in CURRENT_CONFIG[]
-byte verticalPositionValueIndex = 0x4d; // 77
-byte contrastValueIndex = 0xfe;
-byte horizontalPositionValueIndex = 0xb0; // 176
-byte heightValueIndex = 0xf0;             // 240
-byte widthValueIndex = 0x19;              // 25
-byte brightnessValueIndex = 0x0a;
-byte parallelogramValueIndex = 0xc6; // 198
-byte keystoneValueIndex = 0x9b;      // 155
-byte rotationValueIndex = 0x42;      // 66
-byte pincushionValueIndex = 0xcb;    // 203
-
-// Serial communication buffer for protocol handling
-// SERIAL_BUFFER_MAX_SIZE = 32 bytes (0x20)
 byte SERIAL_BUFFER[SERIAL_BUFFER_MAX_SIZE];
-byte SERIAL_BUFFER_DATA_SIZE;  // Current fill level in buffer
-
-// Current configuration stored in SRAM (loaded from EEPROM)
-// Size: CONFIG_EEPROM_SLOTS (26 bytes: 25 settings + 1 checksum)
+byte SERIAL_BUFFER_DATA_SIZE;
 byte CURRENT_CONFIG[CONFIG_EEPROM_SLOTS];
-
-// First-run flag stored in EEPROM to detect initial firmware flash
-// Value 0x79 indicates firmware has been configured at least once
 byte FIRST_RUN = 0x79;
 
-// Holds last received I2C data byte (populated by receiveData callback)
-// Currently unused but reserved for future bidirectional protocol implementation
 byte data = -1;
 
-// =============================================================================
-// PIN CONFIGURATION
-// =============================================================================
-
-// Solid-state relay pin for CRT power control
-// HIGH = relay energized, CRT powered on
-// LOW = relay de-energized, CRT powered off
+//define solid state relay and power button pins
 byte solid_state_relay_Pin = 7;
 
-// Power button pin connected to front panel button
-// Pulled HIGH internally, button connects to ground when pressed
 byte powerButtonPin = 3;
+//int powerButtonPin = 13;
 
-// VSYNC input pin for detecting active video signal
-// Connected to CRT's VSYNC output
-// Used for auto-power-off after 180 seconds of no signal
+//define state variables
+byte externalCircuitState = LOW;
+byte buttonState = LOW;
+byte prevVsyncActive = 0;
+byte vsyncWasDecrementing = 0;
+byte autoVsyncPowerOn = 0;
+byte userRequestedOff = 0;
+
+//vsync pin
 byte vsyncPin = 10;
 
-// =============================================================================
-// STATE VARIABLES
-// =============================================================================
 
-// Current state of CRT power circuit
-// HIGH = CRT is on, LOW = CRT is off
-byte externalCircuitState = LOW;
-
-// Current reading of power button pin
-// Used for debounce and state change detection
-byte buttonState = LOW;
-
-// =============================================================================
-// TIMING AND COUNTERS
-// =============================================================================
-
-// Time before auto power-off when no VSYNC detected (180 seconds)
+//vsync power off countdown in seconds
 byte vsync_off_time = 180;
 
-// Debounce counter for power button
-// Counts consecutive LOW readings (button pressed)
+//counters
 byte buttonPressedTime = 0;
-
-// VSYNC pulse counter for auto-shutdown
-// Increments on each VSYNC pulse, decrements every second
 byte vsyncDetect = 0;
+unsigned long currentTime = 0;
+unsigned long startTime = 0;
+unsigned long elapsedTime = 0;
 
-// Timing variables for elapsed time calculation
-unsigned long currentTime = 0;   // Current millis() reading
-unsigned long startTime = 0;      // Last VSYNC or second marker
-unsigned long elapsedTime = 0;   // Time since last event
+//The init sequence is sent on a software i2c bus.
+// sda is on 4 and scl is on 5
+SoftwareWire softWire( 4, 5);
 
-// =============================================================================
-// SOFTWARE I2C INITIALIZATION
-// =============================================================================
 
-// SoftwareWire instance for IVAD communication
-// Uses pins 4 (SDA) and 5 (SCL) for I2C bus to IVAD board
-// Configured as master to send init sequences and settings
-SoftwareWire softWire(4, 5);
 
-/**
- * @brief Initialize all subsystems
- *
- * Performs one-time initialization of:
- * - GPIO pins (direction configuration)
- * - EEPROMWearLevel library for persistent storage
- * - I2C interfaces (hardware as slave, software as master)
- * - Serial communication
- * - I2C event handlers
- * - Default settings on first firmware flash
- *
- * @note CRT remains OFF after setup() - call externalCircuitOn() to power on
- */
-void setup()
-{
 
-  // define pin direction
+void setup() {
+
+  //define pin direction
   pinMode(solid_state_relay_Pin, OUTPUT);
   pinMode(powerButtonPin, INPUT);
-  pinMode(vsyncPin, INPUT); // this pin is used to monitor VSYNC.
-  pinMode(8, INPUT);        // this pin is on the J5 connector for general use PB0.
-  pinMode(9, INPUT);        // this pin is on the J5 connector for general use PB1.
+  pinMode(vsyncPin, INPUT);//this pin is used to monitor VSYNC.
+  pinMode(8, INPUT);//this pin is on the J5 connector for general use PB0.
+  pinMode(9, INPUT);//this pin is on the J5 connector for general use PB1.
 
-  EEPROMwl.begin(CONFIG_EEPROM_VERSION, CONFIG_EEPROM_SLOTS + 1);
-  Wire.begin(0x50);     // join as slave and wait for EDID requests
-  softWire.begin();     // join as master and send init sequence
-  Serial.begin(115200); // use built in serial
+  EEPROMwl.begin(CONFIG_EEPROM_VERSION, CONFIG_EEPROM_SLOTS + 2);
+  Wire.begin(0x50); //join as slave and wait for EDID requests
+  softWire.begin();// join as master and send init sequence
+  Serial.begin(115200);//use built in serial
   Serial.setTimeout(1000);
 
-  Wire.onRequest(requestEvent); // event handler for requests from master
-  Wire.onReceive(receiveData);  // event handler when receiving from  master
+  Wire.onRequest(requestEvent); //event handler for requests from master
+  Wire.onReceive(receiveData); // event handler when receiving from  master
   // turn it all off
   externalCircuitOff();
 
-  // check to see if it's the 1st time running after burning firmware
+  Serial.println(F("iMac G3 IVAD Init ready."));
+  Serial.println(F("Type '?' for help."));
+
+  // Sentinel is version-dependent: changing CONFIG_EEPROM_VERSION always triggers first run.
+  const byte FIRST_RUN_SENTINEL = 0x79 ^ CONFIG_EEPROM_VERSION;
   FIRST_RUN = EEPROMwl.read(CONFIG_EEPROM_SLOTS);
-  if (FIRST_RUN != 0x79)
-  {
-    EEPROMwl.update(CONFIG_EEPROM_SLOTS, 0x79);
+  if (FIRST_RUN != FIRST_RUN_SENTINEL ) {
+    Serial.print(F("[EEPROM] First run detected (sentinel="));
+    Serial.print(FIRST_RUN);
+    Serial.print(F(", expected="));
+    Serial.print(FIRST_RUN_SENTINEL);
+    Serial.println(F("). Writing defaults."));
+    EEPROMwl.update(CONFIG_EEPROM_SLOTS, FIRST_RUN_SENTINEL);
+    EEPROMwl.update(AUTO_POWER_ON_EEPROM_SLOT, 0x00);
+    Serial.println(F("[EEPROM] Wrote first-run sentinel and auto power-on default."));
     settings_reset_default();
     settings_store();
     settings_load();
     ivad_write_settings();
-  } // end if
+  }//end if
 
-  // externalCircuitOn();
+  // load auto vsync power-on setting; treat anything other than 0x01 as disabled
+  autoVsyncPowerOn = (EEPROMwl.read(AUTO_POWER_ON_EEPROM_SLOT) == 0x01) ? 1 : 0;
+  Serial.print(F("[AUTO] Auto power on: "));
+  Serial.println(autoVsyncPowerOn ? F("ENABLED") : F("DISABLED"));
 
-} // end setup
+}//end setup
 
-/**
- * @brief Main event loop
- *
- * Continuously executes the following operations:
- * 1. Reads power button state
- * 2. When CRT is on: processes serial commands and monitors VSYNC
- * 3. Monitors VSYNC to detect active video signal
- * 4. Auto-power-off after 180 seconds without VSYNC
- * 5. Detects button presses for power toggle
- *
- * @note VSYNC monitoring prevents CRT from staying on with no signal
- * @note Button debouncing prevents accidental triggers
- */
-void loop()
-{
+void loop() {
 
   buttonState = digitalRead(powerButtonPin);
 
+  serial_processing();
+
   // do stuff only when the CRT is on
-  if (externalCircuitState == HIGH)
-  {
+  if ( externalCircuitState == HIGH ) {
 
     currentTime = millis();
     elapsedTime = currentTime - startTime;
 
-    serial_processing();
 
-    // increment vsyncDetect everytime vsync is detected
-    if (pulseIn(vsyncPin, HIGH, 10000) > 0)
-    {
+    //increment vsyncDetect everytime vsync is detected
+    if (pulseIn(vsyncPin, HIGH, 30000) > 0) {
 
-      if (vsyncDetect < vsync_off_time)
-      {
+      if (vsyncDetect < vsync_off_time) {
         vsyncDetect++;
-      } // end if
+      }//end if
       startTime = currentTime = millis();
-    } // end if
 
-    // decrement vsyncDetect whenever one second elapses
-    if (elapsedTime >= 1000 && vsyncDetect > 0)
-    {
+      if (!prevVsyncActive) {
+        prevVsyncActive = 1;
+        Serial.println(F("[VSYNC] signal detected."));
+      } else if (vsyncWasDecrementing) {
+        vsyncWasDecrementing = 0;
+        Serial.print(F("[VSYNC] signal restored, countdown: "));
+        Serial.println(vsyncDetect);
+      }
+    }//end if
+
+
+    //decrement vsyncDetect whenever one second elapses
+    if (elapsedTime >= 1000 && vsyncDetect > 0) {
       vsyncDetect--;
+      vsyncWasDecrementing = 1;
+      Serial.print(F("[VSYNC] countdown: "));
+      Serial.println(vsyncDetect);
       startTime = currentTime = millis();
     }
 
-    // do stuff whn vsyncDetect is 0
-    if (vsyncDetect <= 0)
-    {
+    //do stuff whn vsyncDetect is 0
+    if (vsyncDetect <= 0) {
       startTime = 0;
       currentTime = 0;
+      prevVsyncActive = 0;
+      Serial.println(F("[VSYNC] signal lost. Powering off."));
       externalCircuitOff();
     }
 
-  } // end if
+  }//end if
 
-  if (buttonState == LOW)
+  // auto power on: monitor vsync even when display is off
+  if (externalCircuitState == LOW && (autoVsyncPowerOn || userRequestedOff)) {
+    if (pulseIn(vsyncPin, HIGH, 30000) > 0) {
+      if (autoVsyncPowerOn && !userRequestedOff) {
+        Serial.println(F("[AUTO] Vsync detected. Powering on."));
+        externalCircuitOn();
+        startTime = millis();
+        currentTime = millis();
+        vsyncDetect = vsync_off_time;
+      }
+    } else {
+      // vsync is absent: clear the manual-off lock so auto power-on can fire next time
+      if (userRequestedOff) {
+        userRequestedOff = 0;
+        Serial.println(F("[AUTO] Vsync absent. Manual off lock cleared."));
+      }
+    }
+  }
+
+  if (buttonState == LOW )
   {
-    if (buttonPressedTime <= 10)
-    {
+    if (buttonPressedTime <= 10) {
       buttonPressedTime++;
-    } // end if
+    }//end if
+
+
+
   }
   else
   {
-    buttonPressedTime = 0;
+    //buttonPressedTime = 0;
+
   }
 
-  // turn everything off if button is pressed for 10 ms
-  if (buttonPressedTime > 0 && externalCircuitState == HIGH && buttonState == HIGH)
-  {
+  //turn everything off if button is pressed for 10 ms
+  if (buttonPressedTime > 0 && externalCircuitState == HIGH && buttonState == HIGH) {
+    userRequestedOff = 1;
     externalCircuitOff();
     buttonPressedTime = 0;
+
   }
 
-  // turn everything on if button is pressed for 10 ms
-  if (buttonPressedTime > 0 && externalCircuitState == LOW && buttonState == HIGH)
-  {
+  //turn everything on if button is pressed for 10 ms
+  if (buttonPressedTime > 0 && externalCircuitState == LOW  && buttonState == HIGH) {
     externalCircuitOn();
     buttonPressedTime = 0;
     startTime = millis();
     currentTime = millis();
     vsyncDetect = vsync_off_time;
+
   }
 
-} // end loop
 
-void handleSerial(char incoming)
-{
-  /**
-   * @brief Process single-character serial commands for manual adjustment
-   *
-   * Maps keyboard characters to display geometry adjustments.
-   * Called by serial_processing() for non-protocol characters.
-   *
-   * Key mappings:
-   * | Key | Action           | Setting Index         |
-   * |-----|------------------|-----------------------|
-   * | a/s | Move left/right  | HORIZONTAL_POS        |
-   * | w/z | Move up/down     | VERTICAL_POS          |
-   * | d/f | Narrower/wider   | WIDTH                 |
-   * | r/c | Taller/shorter   | HEIGHT                |
-   * | g/h | Contrast -/+     | CONTRAST              |
-   * | j/k | Brightness -/+   | BRIGHTNESS            |
-   * | x/v | Parallelogram    | PARALLELOGRAM         |
-   * | b/n | Keystone         | KEYSTONE              |
-   * | t/y | Rotate           | ROTATION              |
-   * | u/i | Pincushion       | PINCUSHION            |
-   * | p   | Print settings   | Debug output          |
-   * | o   | Power off        | externalCircuitOff()  |
-   *
-   * @param incoming Character received from serial console
-   * @see handleSerial() for protocol-based adjustments
-   */
 
-  // if (Serial.available() > 0) {
-  //  char incoming = Serial.read();
+
+}//end loop
+
+
+
+void handleSerial(char incoming) {
+  /*
+     a = move left
+     s = move right
+     w = move up
+     z = move down
+
+     d = skinnier
+     f = fatter
+     r = taller
+     c = shorter
+
+     g = contrast down
+     h = contrast up
+
+     j = brightness down
+     k = brightness up
+
+
+  */
+
+
+  //if (Serial.available() > 0) {
+  // char incoming = Serial.read();
 
   int index = -1;
   bool increment = true;
-  switch (incoming)
-  {
-    case 'a': // move left
-      // moveHorizontal(+1);
+  const __FlashStringHelper* desc = NULL;
+  switch (incoming) {
+    case 'a':
       index = IVAD_SETTING_HORIZONTAL_POS;
+      desc = F("move left");
       break;
-    case 's': // move right
-      // moveHorizontal(-1);
+    case 's':
       index = IVAD_SETTING_HORIZONTAL_POS;
       increment = false;
+      desc = F("move right");
       break;
-    case 'w': // move up
-      // moveVertical(-1);
+    case 'w':
       index = IVAD_SETTING_VERTICAL_POS;
       increment = false;
+      desc = F("move up");
       break;
-    case 'z': // move down
-      // moveVertical(+1);
+    case 'z':
       index = IVAD_SETTING_VERTICAL_POS;
+      desc = F("move down");
       break;
-    case 'd': // make skinnier
-      // changeWidth(+1);
+    case 'd':
       index = IVAD_SETTING_WIDTH;
+      desc = F("narrower");
       break;
-    case 'f': // make fatter
-      // changeWidth(-1);
+    case 'f':
       index = IVAD_SETTING_WIDTH;
       increment = false;
+      desc = F("wider");
       break;
-    case 'r': // make taller
-      // changeHeight(+1);
+    case 'r':
       index = IVAD_SETTING_HEIGHT;
+      desc = F("taller");
       break;
-    case 'c': // make shorter
-      // changeHeight(-1);
+    case 'c':
       index = IVAD_SETTING_HEIGHT;
       increment = false;
+      desc = F("shorter");
       break;
-    case 'g': // decrease contrast
-      // changeContrast(-1);
+    case 'g':
       index = IVAD_SETTING_CONTRAST;
       increment = false;
+      desc = F("contrast -");
       break;
-    case 'h': // increase contrast
-      // changeContrast(+1);
+    case 'h':
       index = IVAD_SETTING_CONTRAST;
+      desc = F("contrast +");
       break;
-    case 'j': // decrease brightness
-      // changeBrightness(-1);
+    case 'j':
       index = IVAD_SETTING_BRIGHTNESS;
       increment = false;
+      desc = F("brightness -");
       break;
-    case 'k': // increase brightness
-      // changeBrightness(+1);
+    case 'k':
       index = IVAD_SETTING_BRIGHTNESS;
+      desc = F("brightness +");
       break;
-    case 'x': // tilt paralellogram left
-      // changeParallelogram(+1);
+    case 'x':
       index = IVAD_SETTING_PARALLELOGRAM;
+      desc = F("parallelogram +");
       break;
-    case 'v': // tilt paralellogram right
-      // changeParallelogram(-1);
+    case 'v':
       index = IVAD_SETTING_PARALLELOGRAM;
       increment = false;
+      desc = F("parallelogram -");
       break;
-    case 'b': // keystone pinch top
-      // changeKeystone(-1);
+    case 'b':
       index = IVAD_SETTING_KEYSTONE;
       increment = false;
+      desc = F("keystone pinch top");
       break;
-    case 'n': // keystone pinch bottom
-      // changeKeystone(+1);
+    case 'n':
       index = IVAD_SETTING_KEYSTONE;
+      desc = F("keystone pinch bot");
       break;
-    case 't': // rotate left
-      // changeRotation(+1);
+    case 't':
       index = IVAD_SETTING_ROTATION;
+      desc = F("rotate CW");
       break;
-    case 'y': // rotate right
-      // changeRotation(-1);
+    case 'y':
       index = IVAD_SETTING_ROTATION;
       increment = false;
+      desc = F("rotate CCW");
       break;
-    case 'u': // pincushion pull corners out
-      // changePincushion(-1);
+    case 'u':
       index = IVAD_SETTING_PINCUSHION;
       increment = false;
+      desc = F("pincushion out");
       break;
-    case 'i': // pincushion pull corners in
-      // changePincushion(+1);
+    case 'i':
       index = IVAD_SETTING_PINCUSHION;
+      desc = F("pincushion in");
       break;
     case 'p':
       printCurrentSettings();
       break;
-    case 'o': // power off
-      if (externalCircuitState == HIGH)
-      {
+    case 'e'://power on
+      if ( externalCircuitState == LOW ) {
+        externalCircuitOn();
+        startTime = millis();
+        currentTime = millis();
+        vsyncDetect = vsync_off_time;
+        Serial.println(F("[POWER] Display turned on."));
+      } else {
+        Serial.println(F("[POWER] Display already on."));
+      }
+      break;
+    case 'o'://power off
+      if ( externalCircuitState == HIGH ) {
+        userRequestedOff = 1;
         externalCircuitOff();
-      } // end if
+        Serial.println(F("[POWER] Display turned off."));
+      } else {
+        Serial.println(F("[POWER] Display already off."));
+      }
+      break;
+    case 'q':
+      autoVsyncPowerOn = autoVsyncPowerOn ? 0 : 1;
+      EEPROMwl.update(AUTO_POWER_ON_EEPROM_SLOT, autoVsyncPowerOn);
+      Serial.print(F("[AUTO] Auto power on: "));
+      Serial.println(autoVsyncPowerOn ? F("ENABLED") : F("DISABLED"));
+      Serial.print(F("[EEPROM] Saved auto power-on = "));
+      Serial.println(autoVsyncPowerOn);
+      break;
+    case 'l'://re-run init sequence + apply settings
+      if ( externalCircuitState == HIGH ) {
+        Serial.println(F("[IVAD] Re-running init sequence..."));
+        initIvadBoard();
+        settings_load();
+        ivad_write_settings();
+        Serial.println(F("[IVAD] Done. Check for image."));
+      } else {
+        Serial.println(F("[IVAD] Display is off. Power on first with 'e'."));
+      }
+      break;
+    case 'm'://save current settings to EEPROM
+      settings_store();
+      break;
+    case '?':
+      printHelp();
       break;
   }
+  //}
 
-  if (index > -1)
-  {
+  if (index > -1) {
     int val = CURRENT_CONFIG[index];
-    if (increment)
-    {
+    if (increment) {
       val++;
     }
     else
@@ -420,432 +436,338 @@ void handleSerial(char incoming)
     }
 
     ivad_change_setting(index, val);
-  } // end if
+    byte actual = CURRENT_CONFIG[index];
+    Serial.print(F("[SET] "));
+    Serial.print(desc);
+    Serial.print(F(" = "));
+    Serial.print(actual);
+    if (actual == VIDEO_CONFIG_MAX[index]) Serial.print(F(" (MAX)"));
+    else if (actual == VIDEO_CONFIG_MIN[index]) Serial.print(F(" (MIN)"));
+    Serial.println();
+  }//end if
 
-} // end handleSerial
 
-/**
- * @brief Print current settings to serial console (debug)
- *
- * Displays all initial-value variables in hexadecimal format.
- * Note: These are global variables, not CURRENT_CONFIG[] values.
- * This function may print stale/outdated data.
- *
- * @warning These variables are NOT actively used elsewhere
- * @see CURRENT_CONFIG[] for actual current settings
- */
-void printCurrentSettings()
-{
-  Serial.println(F("----------------------------"));
+}//end handleSerial
 
-  Serial.print(F("heightValueIndex: "));
-  Serial.println(heightValueIndex, HEX);
+void printSettingRow(const __FlashStringHelper* label, byte ivad_setting) {
+  byte val  = CURRENT_CONFIG[ivad_setting];
+  byte mn   = VIDEO_CONFIG_MIN[ivad_setting];
+  byte mx   = VIDEO_CONFIG_MAX[ivad_setting];
+  byte span = mx - mn;
+  byte pct  = (span > 0) ? map(val, mn, mx, 0, 100) : 0;
 
-  Serial.print(F("widthValueIndex: "));
-  Serial.println(widthValueIndex, HEX);
-
-  Serial.println("");
-
-  Serial.print(F("verticalPositionValueIndex: "));
-  Serial.println(verticalPositionValueIndex, HEX);
-
-  Serial.print(F("horizontalPositionValueIndex: "));
-  Serial.println(horizontalPositionValueIndex, HEX);
-
-  Serial.println(F(""));
-
-  Serial.print(F("rotationValueIndex: "));
-  Serial.println(rotationValueIndex, HEX);
-
-  Serial.print(F("parallelogramValueIndex: "));
-  Serial.println(parallelogramValueIndex, HEX);
-
-  Serial.print(F("keystoneValueIndex: "));
-  Serial.println(keystoneValueIndex, HEX);
-
-  Serial.print(F("pincushionValueIndex: "));
-  Serial.println(pincushionValueIndex, HEX);
-
-  Serial.println("");
-
-  Serial.print(F("contrastValueIndex: "));
-  Serial.println(contrastValueIndex, HEX);
-
-  Serial.print(F("brightnessValueIndex: "));
-  Serial.println(brightnessValueIndex, HEX);
-
-  Serial.println(F("----------------------------"));
+  Serial.print(F("  "));
+  Serial.print(label);
+  Serial.print(F(": "));
+  if (val < 100) Serial.print(' ');
+  if (val < 10)  Serial.print(' ');
+  Serial.print(val);
+  Serial.print(F("  ("));
+  if (pct < 100) Serial.print(' ');
+  if (pct < 10)  Serial.print(' ');
+  Serial.print(pct);
+  Serial.print(F("%  min="));
+  if (mn < 100) Serial.print(' ');
+  if (mn < 10)  Serial.print(' ');
+  Serial.print(mn);
+  Serial.print(F(" max="));
+  if (mx < 100) Serial.print(' ');
+  if (mx < 10)  Serial.print(' ');
+  Serial.print(mx);
+  Serial.println(')');
 }
 
-/**
- * @brief Write single byte to IVAD via I2C
- * @param address I2C slave address (0x46 for properties, 0x53 for unlock)
- * @param message Single byte to transmit
- */
-void writeToIvad(byte address, byte message)
-{
+void printCurrentSettings() {
+  Serial.println(F("======= CURRENT SETTINGS ======="));
+
+  Serial.println(F("  -- Display Status --"));
+  Serial.print(F("  power       : "));
+  Serial.println(externalCircuitState == HIGH ? F("ON") : F("OFF"));
+  Serial.print(F("  vsync       : "));
+  Serial.println(prevVsyncActive ? F("detected") : F("not detected"));
+  Serial.print(F("  vsync timer : "));
+  Serial.print(vsyncDetect);
+  Serial.print('/');
+  Serial.println(vsync_off_time);
+  Serial.print(F("  auto pwr on : "));
+  Serial.println(autoVsyncPowerOn ? F("ENABLED") : F("DISABLED"));
+  Serial.print(F("  manual off  : "));
+  Serial.println(userRequestedOff ? F("locked (waiting for vsync loss)") : F("no lock"));
+
+
+  Serial.println(F("  -- Size --"));
+  printSettingRow(F("height      "), IVAD_SETTING_HEIGHT);
+  printSettingRow(F("width       "), IVAD_SETTING_WIDTH);
+
+  Serial.println(F("  -- Position --"));
+  printSettingRow(F("horiz pos   "), IVAD_SETTING_HORIZONTAL_POS);
+  printSettingRow(F("vert pos    "), IVAD_SETTING_VERTICAL_POS);
+
+  Serial.println(F("  -- Geometry --"));
+  printSettingRow(F("rotation    "), IVAD_SETTING_ROTATION);
+  printSettingRow(F("parallelgrm "), IVAD_SETTING_PARALLELOGRAM);
+  printSettingRow(F("keystone    "), IVAD_SETTING_KEYSTONE);
+  printSettingRow(F("pincushion  "), IVAD_SETTING_PINCUSHION);
+  printSettingRow(F("s-correct   "), IVAD_SETTING_S_CORRECTION);
+  printSettingRow(F("pinc balance"), IVAD_SETTING_PINCUSHION_BALANCE);
+
+  Serial.println(F("  -- Color/Luma --"));
+  printSettingRow(F("contrast    "), IVAD_SETTING_CONTRAST);
+  printSettingRow(F("brightness  "), IVAD_SETTING_BRIGHTNESS);
+  printSettingRow(F("red drive   "), IVAD_SETTING_RED_DRIVE);
+  printSettingRow(F("green drive "), IVAD_SETTING_GREEN_DRIVE);
+  printSettingRow(F("blue drive  "), IVAD_SETTING_BLUE_DRIVE);
+  printSettingRow(F("red cutoff  "), IVAD_SETTING_RED_CUTOFF);
+  printSettingRow(F("green cutoff"), IVAD_SETTING_GREEN_CUTOFF);
+  printSettingRow(F("blue cutoff "), IVAD_SETTING_BLUE_CUTOFF);
+
+  Serial.println(F("================================"));
+}
+
+void printHelp() {
+  Serial.println(F("========== HELP =========="));
+  Serial.println(F("--- Power ---"));
+  Serial.println(F("  e  : power on"));
+  Serial.println(F("  o  : power off"));
+  Serial.println(F("  l  : re-run IVAD init sequence (display must be on)"));
+  Serial.println(F("  q  : toggle auto power on when vsync detected (saved to EEPROM)"));
+  Serial.println(F("--- Position ---"));
+  Serial.println(F("  a  : move left      s  : move right"));
+  Serial.println(F("  w  : move up        z  : move down"));
+  Serial.println(F("--- Size ---"));
+  Serial.println(F("  d  : narrower       f  : wider"));
+  Serial.println(F("  r  : taller         c  : shorter"));
+  Serial.println(F("--- Geometry ---"));
+  Serial.println(F("  x  : parallelogram +   v  : parallelogram -"));
+  Serial.println(F("  b  : keystone pinch top   n  : keystone pinch bot"));
+  Serial.println(F("  t  : rotate CW      y  : rotate CCW"));
+  Serial.println(F("  u  : pincushion out  i  : pincushion in"));
+  Serial.println(F("--- Color/Luma ---"));
+  Serial.println(F("  g  : contrast -     h  : contrast +"));
+  Serial.println(F("  j  : brightness -   k  : brightness +"));
+  Serial.println(F("--- Save ---"));
+  Serial.println(F("  m  : save current settings to EEPROM"));
+  Serial.println(F("--- Info ---"));
+  Serial.println(F("  p  : print current settings"));
+  Serial.println(F("  ?  : print this help"));
+  Serial.println(F("=========================="));
+}
+
+byte i2cErrors = 0;
+
+void writeToIvad(byte address, byte message) {
   softWire.beginTransmission(address);
   softWire.write(message);
-  softWire.endTransmission();
+  byte err = softWire.endTransmission();
+  if (err) i2cErrors++;
 
-} // end method
+}//end method
 
-/**
- * @brief Write register/value pair to IVAD via I2C
- * @param address  I2C slave address (0x46 typically)
- * @param message1 Register/setting index (0x00-0x12)
- * @param message2 Value to write to register
- */
-void writeToIvad(byte address, byte message1, byte message2)
-{
+void writeToIvad(byte address, byte message1, byte message2) {
   softWire.beginTransmission(address);
   softWire.write(message1);
   softWire.write(message2);
-  softWire.endTransmission();
+  byte err = softWire.endTransmission();
+  if (err) i2cErrors++;
 
-} // end method
+}//end method
 
-/**
- * @brief Read data from IVAD via I2C
- *
- * Reads bytes from IVAD board and stores in local buffer.
- * Currently data is not used (reserved for future protocol features).
- *
- * @param address I2C slave address to read from
- * @param bytes   Number of bytes to request
- * @note Read data discarded after retrieval
- */
-void readFromIvad(byte address, byte bytes)
-{
-  char buf[bytes + 1];
-  byte bytesRead = 0;
+void  readFromIvad(byte address, byte bytes) {
   softWire.requestFrom(address, bytes);
   while (softWire.available())
   {
-    char c = softWire.read();
-    buf[bytesRead++] = c;
+    softWire.read();
   }
-  buf[bytesRead] = '\0';
 
-} // end method
+}//end method
 
-/**
- * @brief Initialize IVAD board with startup sequence
- *
- * This function contains the critical I2C initialization sequence that
- * configures the IVAD board to accept video input. It must be called
- * before the CRT can display any image.
- *
- * Sequence breakdown:
- * 1. Reset registers 0x46 (property) and 0x53 (unknown/unlock)
- * 2. Read calibration data from 0x53 address space (10 reads)
- * 3. Write 18 configuration registers (0x01-0x12) with calibrated values
- * 4. Lock configuration by setting register 0x00 to 0xFF
- * 5. Re-read calibration data for verification
- * 6. Final geometry and color adjustments
- *
- * @note This sequence was captured from original iMac G3 logic board
- * @warning Must be called BEFORE ivad_write_settings()
- * @see externalCircuitOn() which calls this function
- */
-void initIvadBoard()
-{
 
-  //  //init sequence 2 <---this is the one that works well with my iMac G3, Rocky Hill
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_WIDTH, 0x00);
-  //  readFromIvad(IVAD_REGISTER_PROPERTY, 1);
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_VERTICAL_POS, 0x00);
-  //  writeToIvad( 0x53, 0x33);
-  //  readFromIvad(0x53, 1);
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_WIDTH, 0x0B);
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_CONTRAST, 0x00); //setting contrast to 0x00 seems to turn something on.
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_HEIGHT, 0xE4);
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_ROTATION, 0xC9);
-  //  writeToIvad( 0x53, 0x00);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x0A);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x14);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x1E);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x28);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x32);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x3C);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x46);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x50);
-  //  readFromIvad(0x53, 10);
-  //  writeToIvad( 0x53, 0x5A);
-  //  readFromIvad(0x53, 2);
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_RED_CUTOFF,         VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_RED_CUTOFF ]        );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_GREEN_CUTOFF,       VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_GREEN_CUTOFF ]      );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_BLUE_CUTOFF,        VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_BLUE_CUTOFF ]       );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_HORIZONTAL_POS,     VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_HORIZONTAL_POS ]    );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_HEIGHT,             VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_HEIGHT ]            );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_VERTICAL_POS,       VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_VERTICAL_POS ]      );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_S_CORRECTION,       VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_S_CORRECTION ]      );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_KEYSTONE,           VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_KEYSTONE ]          );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_PINCUSHION,         VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_PINCUSHION ]        );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_WIDTH,              VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_WIDTH ]             );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_PINCUSHION_BALANCE, VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_PINCUSHION_BALANCE ]);
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_PARALLELOGRAM,      VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_PARALLELOGRAM ]     );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_RESERVED6,          VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_RESERVED6 ]         ); // brightness
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_BRIGHTNESS,         VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_BRIGHTNESS ]        );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_ROTATION,           VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_ROTATION ]          );
-  //  writeToIvad( IVAD_REGISTER_PROPERTY, IVAD_SETTING_CONTRAST,           VIDEO_CONFIG_DEFAULT[ IVAD_SETTING_CONTRAST ]          );
+void initIvadBoard() {
 
-  // provided by anothere
-  writeToIvad(0x46, 0x13, 0x00);
-  writeToIvad(0x46, 0x13, 0x00);
-  readFromIvad(0x46, 1);
-  writeToIvad(0x46, 0x09, 0x00);
-  writeToIvad(0x53, 0x33);
-  readFromIvad(0x53, 1);
-  writeToIvad(0x46, 0x13, 0x0b);
-  writeToIvad(0x46, 0x00, 0x00);
-  writeToIvad(0x46, 0x08, 0xe4);
-  writeToIvad(0x46, 0x12, 0xc9);
-  writeToIvad(0x53, 0x00);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x0a);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x14);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x1e);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x28);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x32);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x3c);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x46);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x50);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x5a);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x46, 0x01, 0x82);
-  writeToIvad(0x46, 0x02, 0x82);
-  writeToIvad(0x46, 0x03, 0x82);
-  writeToIvad(0x46, 0x04, 0xa0);
-  writeToIvad(0x46, 0x05, 0xa0);
-  writeToIvad(0x46, 0x06, 0xa0);
-  writeToIvad(0x46, 0x07, 0xad);
-  writeToIvad(0x46, 0x08, 0xe4);
-  writeToIvad(0x46, 0x09, 0x3d);
-  writeToIvad(0x46, 0x0a, 0x9e);
-  writeToIvad(0x46, 0x0b, 0xb4);
-  writeToIvad(0x46, 0x0c, 0xc4);
-  writeToIvad(0x46, 0x0d, 0x27);
-  writeToIvad(0x46, 0x0e, 0xbf);
-  writeToIvad(0x46, 0x0f, 0xc0);
-  writeToIvad(0x46, 0x10, 0x40);
-  writeToIvad(0x46, 0x11, 0x0a);
-  writeToIvad(0x46, 0x12, 0x5b);
-  writeToIvad(0x46, 0x00, 0xff);
-  writeToIvad(0x53, 0x00);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x10);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x20);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x53, 0x30);
-  readFromIvad(0x53, 10);
-  writeToIvad(0x46, 0x11, 0x05);
-  writeToIvad(0x46, 0x00, 0xff);
-  writeToIvad(0x46, 0x00, 0x00);
-  writeToIvad(0x46, 0x07, 0xb1);
-  writeToIvad(0x46, 0x0d, 0x10);
-  writeToIvad(0x46, 0x0c, 0xc7);
-  writeToIvad(0x46, 0x09, 0x4a);
-  writeToIvad(0x46, 0x08, 0xea);
-  writeToIvad(0x46, 0x0f, 0xc0);
-  writeToIvad(0x46, 0x0b, 0xae);
-  writeToIvad(0x46, 0x12, 0x5b);
-  writeToIvad(0x46, 0x00, 0xff);
-  writeToIvad(0x46, 0x11, 0x05);
-  writeToIvad(0x46, 0x00, 0xff);
-  writeToIvad(0x46, 0x10, 0x40);
-  writeToIvad(0x46, 0x06, 0xa0);
-  writeToIvad(0x46, 0x05, 0xa0);
-  writeToIvad(0x46, 0x04, 0xa0);
-  writeToIvad(0x46, 0x03, 0x82);
-  writeToIvad(0x46, 0x02, 0x82);
-  writeToIvad(0x46, 0x01, 0x82);
-  writeToIvad(0x46, 0x11, 0x05);
-  writeToIvad(0x46, 0x00, 0xff);
-  writeToIvad(0x46, 0x11, 0x05);
-  writeToIvad(0x46, 0x00, 0xff);
-  writeToIvad(0x46, 0x10, 0x40);
-  writeToIvad(0x46, 0x06, 0xa0);
-  writeToIvad(0x46, 0x05, 0xa0);
-  writeToIvad(0x46, 0x04, 0xa0);
-  writeToIvad(0x46, 0x03, 0x82);
-  writeToIvad(0x46, 0x02, 0x82);
-  writeToIvad(0x46, 0x01, 0x82);
-  writeToIvad(0x46, 0x11, 0x05);
-  writeToIvad(0x46, 0x00, 0xff);
+  Serial.println(F("[IVAD] Init sequence starting..."));
+  i2cErrors = 0;
+
+  writeToIvad( 0x46,0x13,0x00);
+  writeToIvad(0x46,0x13,0x00);
+  readFromIvad(0x46,1);
+  writeToIvad(0x46,0x09,0x00);
+  writeToIvad(0x53,0x33);
+  readFromIvad(0x53,1);
+  writeToIvad(0x46,0x13,0x0b);
+  writeToIvad(0x46,0x00,0x00);
+  writeToIvad(0x46,0x08,0xe4);
+  writeToIvad(0x46,0x12,0xc9);
+  writeToIvad(0x53,0x00);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x0a);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x14);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x1e);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x28);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x32);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x3c);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x46);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x50);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x5a);
+  readFromIvad(0x53,10);
+  writeToIvad(0x46,0x01,0x82);
+  writeToIvad(0x46,0x02,0x82);
+  writeToIvad(0x46,0x03,0x82);
+  writeToIvad(0x46,0x04,0xa0);
+  writeToIvad(0x46,0x05,0xa0);
+  writeToIvad(0x46,0x06,0xa0);
+  writeToIvad(0x46,0x07,0xad);
+  writeToIvad(0x46,0x08,0xe4);
+  writeToIvad(0x46,0x09,0x3d);
+  writeToIvad(0x46,0x0a,0x9e);
+  writeToIvad(0x46,0x0b,0xb4);
+  writeToIvad(0x46,0x0c,0xc4);
+  writeToIvad(0x46,0x0d,0x27);
+  writeToIvad(0x46,0x0e,0xbf);
+  writeToIvad(0x46,0x0f,0xc0);
+  writeToIvad(0x46,0x10,0x40);
+  writeToIvad(0x46,0x11,0x0a);
+  writeToIvad(0x46,0x12,0x5b);
+  writeToIvad(0x46,0x00,0xff);
+  writeToIvad(0x53,0x00);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x10);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x20);
+  readFromIvad(0x53,10);
+  writeToIvad(0x53,0x30);
+  readFromIvad(0x53,10);
+  writeToIvad(0x46,0x11,0x05);
+  writeToIvad(0x46,0x00,0xff);
+  writeToIvad(0x46,0x00,0x00);
+  writeToIvad(0x46,0x07,0xb1);
+  writeToIvad(0x46,0x0d,0x10);
+  writeToIvad(0x46,0x0c,0xc7);
+  writeToIvad(0x46,0x09,0x4a);
+  writeToIvad(0x46,0x08,0xea);
+  writeToIvad(0x46,0x0f,0xc0);
+  writeToIvad(0x46,0x0b,0xae);
+  writeToIvad(0x46,0x12,0x5b);
+  writeToIvad(0x46,0x00,0xff);
+  writeToIvad(0x46,0x11,0x05);
+  writeToIvad(0x46,0x00,0xff);
+  writeToIvad(0x46,0x10,0x40);
+  writeToIvad(0x46,0x06,0xa0);
+  writeToIvad(0x46,0x05,0xa0);
+  writeToIvad(0x46,0x04,0xa0);
+  writeToIvad(0x46,0x03,0x82);
+  writeToIvad(0x46,0x02,0x82);
+  writeToIvad(0x46,0x01,0x82);
+  writeToIvad(0x46,0x11,0x05);
+  writeToIvad(0x46,0x00,0xff);
+  writeToIvad(0x46,0x11,0x05);
+  writeToIvad(0x46,0x00,0xff);
+  writeToIvad(0x46,0x10,0x40);
+  writeToIvad(0x46,0x06,0xa0);
+  writeToIvad(0x46,0x05,0xa0);
+  writeToIvad(0x46,0x04,0xa0);
+  writeToIvad(0x46,0x03,0x82);
+  writeToIvad(0x46,0x02,0x82);
+  writeToIvad(0x46,0x01,0x82);
+  writeToIvad(0x46,0x11,0x05);
+  writeToIvad(0x46,0x00,0xff);
+
+  Serial.print(F("[IVAD] Init sequence complete. I2C errors: "));
+  Serial.println(i2cErrors);
 }
 
-/**
- * @brief Activate solid-state relay to power on CRT
- *
- * Sets relay control pin HIGH, which energizes the relay coil
- * and connects AC power to the CRT subsystem.
- */
-void solid_state_relayOn()
-{
+
+void solid_state_relayOn() {
   digitalWrite(solid_state_relay_Pin, HIGH);
+
 }
 
-/**
- * @brief Deactivate solid-state relay to power off CRT
- *
- * Sets relay control pin LOW, which de-energizes the relay coil
- * and disconnects AC power from the CRT subsystem.
- */
-void solid_state_relayOff()
-{
+void solid_state_relayOff() {
   digitalWrite(solid_state_relay_Pin, LOW);
+
 }
 
-/**
- * @brief Turn CRT power on with full initialization
- *
- * Complete power-on sequence:
- * 1. Energize solid-state relay (applies power to CRT)
- * 2. Wait 500ms for power stabilization
- * 3. Initialize IVAD board with startup sequence
- * 4. Load saved settings from EEPROM
- * 5. Apply all settings to IVAD board
- *
- * @see solid_state_relayOn()
- * @see initIvadBoard()
- * @see settings_load()
- * @see ivad_write_settings()
- */
-// these are probably too much but they are here in case I would lke to add more stuff to turn on and off
-void externalCircuitOn()
-{
+
+
+
+void externalCircuitOn() {
   solid_state_relayOn();
   delay(500);
   initIvadBoard();
   settings_load();
   ivad_write_settings();
   externalCircuitState = HIGH;
+
+
 }
 
-/**
- * @brief Turn CRT power off
- *
- * Simple power-off sequence:
- * 1. De-energize solid-state relay (removes power from CRT)
- * 2. Update state tracking variable
- *
- * @note IVAD configuration is NOT cleared - next power-on will reuse it
- * @see solid_state_relayOff()
- */
-void externalCircuitOff()
-{
+void externalCircuitOff() {
   solid_state_relayOff();
   externalCircuitState = LOW;
+
 }
 
-/**
- * @brief I2C request handler - responds with EDID data
- *
- * This callback is registered with Wire.onRequest() and executes
- * whenever the Arduino (as I2C slave at address 0x50) receives
- * a read request from the connected computer.
- *
- * EDID (Extended Display Identification Data) is a 128-byte data
- * structure that reports monitor capabilities to the connected
- * computer. This EDID is from an iMac G3 DV and includes:
- * - Manufacturer: Apple Computer, Inc.
- * - Model: iMac G3
- * - Supported resolutions: 1024x768@75Hz, 800x600@95Hz, 640x480@117Hz
- *
- * @note Requires Wire library buffer size increase (32->128 bytes)
- * @see imacG3IvadInit.h for EDID data
- */
-void requestEvent()
-{
-  // delay(500);
+
+
+// function that executes whenever data is requested by master
+// this function is registered as an event.
+void requestEvent() {
+  //delay(500);
   Wire.write(edid, 128);
 
-} // end method
-/**
- * @brief I2C receive handler - called when master sends data
- *
- * This callback is registered with Wire.onReceive() and executes
- * whenever the Arduino receives I2C data from the master.
- *
- * Currently implemented to discard all incoming data to prevent
- * buffer overflow. Reserved for future bidirectional protocol
- * implementation.
- *
- * @param byteCount Number of bytes received from master (ignored)
- * @see requestEvent() for outbound data handler
- */
-void receiveData(int byteCount)
-{
 
-  while (Wire.available())
-  {
+
+}//end method
+// function that executes whenever data is received by the slave
+
+
+void receiveData(byte byteCount) {
+
+
+  while (Wire.available()) {
     data = Wire.read();
   }
 }
 
-/**
- * @brief Parse and execute serial commands
- *
- * Implements oshimai's communications protocol for computer-to-Arduino control.
- * Handles binary packet format:
- * [0x06][ID][CMD][valA][valB][0x03][CHK][0x04][0x0A]
- *
- * Supported commands:
- * - 0x01: Get EEPROM version
- * - 0x02: Dump SRAM configuration (25 bytes + checksum)
- * - 0x03: Change IVAD setting (valA=setting, valB=value)
- * - 0x04: Reload settings from EEPROM
- * - 0x05: Reset all settings to factory defaults
- * - 0x06: Save current SRAM config to EEPROM
- *
- * @note Packet checksum: 256 - (sum % 256), initialized with 1 (never zero)
- * @note Unknown commands return error response (not silently ignored)
- */
+
+/*
+  Serial input handler. Supports two protocols:
+  - Single-character commands (a-z, ?, etc.) for interactive use
+  - 9-byte binary packets (oshimai's protocol) for the CRT control panel app
+*/
 void serial_processing()
 {
 
-  byte b;
+  byte b ;
 
-  if (Serial.available())
-  {
+  if (Serial.available()) {
 
     do
     {
       b = Serial.read();
-      if (SERIAL_BUFFER_DATA_SIZE < SERIAL_BUFFER_MAX_SIZE - 1)
-      {
-        SERIAL_BUFFER[SERIAL_BUFFER_DATA_SIZE++] = b;
-      }
-    } while (Serial.available() && b != SERIAL_EOL_MARKER);
+      SERIAL_BUFFER[SERIAL_BUFFER_DATA_SIZE++] = b;
+    }
+    while (Serial.available() &&  b != SERIAL_EOL_MARKER);
 
-    // call other serial handler
+
+    //call other serial handler
     if (SERIAL_BUFFER_DATA_SIZE != 9)
     {
-      if (SERIAL_BUFFER[0] != 0x07)
-      {
+      if (SERIAL_BUFFER[0] != 0x07) {
         SERIAL_BUFFER_DATA_SIZE = 0;
-        handleSerial((char)b);
+        handleSerial((char)SERIAL_BUFFER[0]);
       }
       return;
+
     }
+
 
     SERIAL_BUFFER_DATA_SIZE = 0;
 
@@ -858,98 +780,88 @@ void serial_processing()
     {
 
       case 0x01: // Get EEPROM Version
-      {
-        byte ret[8]{0x06, id, 0x01, CONFIG_EEPROM_VERSION, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER};
-        ret[5] = checksum(ret, 5);
-        Serial.write(ret, 8);
-      }
-      break;
+        {
+          byte ret[8] { 0x06, id, 0x01, CONFIG_EEPROM_VERSION, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER };
+          ret[5] = checksum(ret, 5);
+          Serial.write(ret, 8);
+        }
+        break;
 
       case 0x02: // Dump SRAM Config
-      {
-        byte ret[7 + CONFIG_EEPROM_SLOTS];
-        ret[0] = 0x06;
-        ret[1] = SERIAL_BUFFER[1];
-        ret[2] = CONFIG_EEPROM_SLOTS;
+        {
+          byte ret[7 + CONFIG_EEPROM_SLOTS];
+          ret[0] = 0x06;
+          ret[1] = SERIAL_BUFFER[1];
+          ret[2] = CONFIG_EEPROM_SLOTS;
 
-        for (int i = 0; i < CONFIG_EEPROM_SLOTS; i++)
-          ret[3 + i] = CURRENT_CONFIG[i];
+          for (int i = 0; i < CONFIG_EEPROM_SLOTS; i++)
+            ret[3 + i] = CURRENT_CONFIG[i];
 
-        ret[2 + CONFIG_EEPROM_SLOTS + 1] = 0x03;
-        ret[2 + CONFIG_EEPROM_SLOTS + 2] = checksum(ret, 2 + CONFIG_EEPROM_SLOTS + 1 + 1);
-        ret[2 + CONFIG_EEPROM_SLOTS + 3] = 0x04;
-        ret[2 + CONFIG_EEPROM_SLOTS + 4] = SERIAL_EOL_MARKER;
-        Serial.write(ret, 7 + CONFIG_EEPROM_SLOTS);
-      }
-      break;
+          ret[2 + CONFIG_EEPROM_SLOTS + 1] = 0x03;
+          ret[2 + CONFIG_EEPROM_SLOTS + 2] = checksum(ret, 2 + CONFIG_EEPROM_SLOTS + 1 + 1);
+          ret[2 + CONFIG_EEPROM_SLOTS + 3] = 0x04;
+          ret[2 + CONFIG_EEPROM_SLOTS + 4] = SERIAL_EOL_MARKER;
+          Serial.write(ret, 7 + CONFIG_EEPROM_SLOTS);
+        }
+        break;
 
       case 0x03: // IVAD Change Setting
-      {
-        ivad_change_setting(valA, valB);
-        byte ret[7]{0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER};
-        ret[4] = checksum(ret, 4);
-        Serial.write(ret, 7);
-      }
-      break;
+        {
+          ivad_change_setting(valA, valB);
+          byte ret[7] { 0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER };
+          ret[4] = checksum(ret, 4);
+          Serial.write(ret, 7);
+        }
+        break;
 
       case 0x04: // IVAD Reset from EEPROM
-      {
-        settings_load();
-        byte ret[7]{0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER};
-        ret[4] = checksum(ret, 4);
-        Serial.write(ret, 7);
-      }
-      break;
+        {
+          settings_load();
+          byte ret[7] { 0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER };
+          ret[4] = checksum(ret, 4);
+          Serial.write(ret, 7);
+        }
+        break;
 
       case 0x05: // EEPROM Reset to Default
-      {
-        settings_reset_default();
-        settings_store();
-        settings_load();
-        ivad_write_settings();
-        byte ret[7]{0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER};
-        ret[4] = checksum(ret, 4);
-        Serial.write(ret, 7);
-      }
-      break;
+        {
+          settings_reset_default();
+          settings_store();
+          settings_load();
+          ivad_write_settings();
+          byte ret[7] { 0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER };
+          ret[4] = checksum(ret, 4);
+          Serial.write(ret, 7);
+        }
+        break;
 
       case 0x06: // Write SRAM to EEPROM
-      {
-        settings_store();
-        byte ret[7]{0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER};
-        ret[4] = checksum(ret, 4);
-        Serial.write(ret, 7);
-      }
-      break;
-
-      default: // Unknown command - no action
-      {
-        byte ret[7]{0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER};
-        ret[4] = checksum(ret, 4);
-        Serial.write(ret, 7);
-      }
-      break;
-    } // end switch
+        {
+          settings_store();
+          byte ret[7] { 0x06, id, 0x00, 0x03, 0xFF, 0x04, SERIAL_EOL_MARKER };
+          ret[4] = checksum(ret, 4);
+          Serial.write(ret, 7);
+        }
+    }//end switch
 
     SERIAL_BUFFER[1] = 0xFF;
+
   }
 
-} // end if
+}//end if
 
-/**
- * @brief Calculate ones-complement checksum for protocol packets
- *
- * Computes: checksum = 256 - (sum(arr[i]) % 256)
- * where sum is initialized to 1 (checksum may never be zero).
- *
- * Used for:
- * - Validating serial protocol packets
- * - Computing configuration checksum for EEPROM storage
- *
- * @param arr   Data array to checksum
- * @param len   Number of bytes to include in checksum
- * @return      Single byte checksum (0x01-0xFF, never 0x00)
- */
+
+
+
+
+
+
+
+
+//===================================
+
+
+
 byte checksum(const byte arr[], const int len)
 {
   int sum = 1; // Checksum may never be 0.
@@ -962,33 +874,15 @@ byte checksum(const byte arr[], const int len)
   return ret;
 }
 
-/**
- * @brief Change IVAD setting with bounds validation
- *
- * Updates a single setting in CURRENT_CONFIG[], validates against
- * MIN/MAX bounds, writes to IVAD board via I2C, and updates checksum.
- *
- * @param ivad_setting Setting index (IVAD_SETTING_XXX enum value)
- * @param value        New value to set (clamped to valid range)
- * @return 0 always (no error conditions)
- *
- * Bounds checking:
- * - Values below VIDEO_CONFIG_MIN[] are clamped to minimum
- * - Values above VIDEO_CONFIG_MAX[] are clamped to maximum
- *
- * @note Automatically updates CONFIG_OFFSET_CHECKSUM (last byte)
- * @see VIDEO_CONFIG_MIN in ivad.h for minimum valid values
- * @see VIDEO_CONFIG_MAX in ivad.h for maximum valid values
- */
-int ivad_change_setting(const int ivad_setting, const byte value)
+
+
+
+int ivad_change_setting(const int ivad_setting, int value)
 {
 
-  CURRENT_CONFIG[ivad_setting] = value;
-
-  if (CURRENT_CONFIG[ivad_setting] < VIDEO_CONFIG_MIN[ivad_setting])
-    CURRENT_CONFIG[ivad_setting] = VIDEO_CONFIG_MIN[ivad_setting];
-  if (CURRENT_CONFIG[ivad_setting] > VIDEO_CONFIG_MAX[ivad_setting])
-    CURRENT_CONFIG[ivad_setting] = VIDEO_CONFIG_MAX[ivad_setting];
+  if (value < (int)VIDEO_CONFIG_MIN[ivad_setting]) value = VIDEO_CONFIG_MIN[ivad_setting];
+  if (value > (int)VIDEO_CONFIG_MAX[ivad_setting]) value = VIDEO_CONFIG_MAX[ivad_setting];
+  CURRENT_CONFIG[ivad_setting] = (byte)value;
 
   writeToIvad(IVAD_REGISTER_PROPERTY, ivad_setting, CURRENT_CONFIG[ivad_setting]);
   CURRENT_CONFIG[CONFIG_OFFSET_CHECKSUM] = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
@@ -996,104 +890,118 @@ int ivad_change_setting(const int ivad_setting, const byte value)
   return 0;
 }
 
-/**
- * @brief Load settings from EEPROM into SRAM
- *
- * Reads all 26 configuration bytes (25 settings + checksum) from
- * EEPROMWearLevel storage and validates checksum.
- *
- * On checksum mismatch:
- * - Resets all settings to factory defaults
- * - Stores validated defaults to EEPROM
- * - Loads them into SRAM
- * - Applies to IVAD board via ivad_write_settings()
- *
- * @note First-run detection: if EEPROM reads 0xFF (empty), initializes defaults
- * @see settings_reset_default()
- * @see settings_store()
- * @see ivad_write_settings()
- */
+
+
+/*
+  This function loads the monitor property values from the EEPROM
+  into variables.
+*/
 void settings_load()
 {
   // Set something so a checksum mismatch can trigger if there's nothing in the EEPROM.
 
-  for (byte eeprom_memory_offset = 0; eeprom_memory_offset < CONFIG_EEPROM_SLOTS; eeprom_memory_offset++)
-  {
+  for (byte eeprom_memory_offset = 0 ; eeprom_memory_offset < CONFIG_EEPROM_SLOTS ; eeprom_memory_offset++) {
     CURRENT_CONFIG[eeprom_memory_offset] = EEPROMwl.read(eeprom_memory_offset);
-  } // end for
+  }//end for
 
   byte loaded_checksum = CURRENT_CONFIG[CONFIG_OFFSET_CHECKSUM];
   byte expected_checksum = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
 
   if (loaded_checksum != expected_checksum)
   {
+    Serial.print(F("[EEPROM] Checksum mismatch (loaded="));
+    Serial.print(loaded_checksum);
+    Serial.print(F(", expected="));
+    Serial.print(expected_checksum);
+    Serial.println(F("). Resetting to defaults."));
     settings_reset_default();
     settings_store();
   }
+
+
 }
 
-/**
- * @brief Apply all settings to IVAD board
- *
- * Writes all 21 IVAD settings from SRAM configuration to the
- * IVAD board via I2C. This synchronizes the hardware with current
- * settings after loading from EEPROM or changing values.
- *
- * @see ivad_change_setting() for single-setting changes
- */
 void ivad_write_settings()
 {
-
-  for (int IVAD_SETTING = 0; IVAD_SETTING < IVAD_SETTING_END; IVAD_SETTING++)
+  i2cErrors = 0;
+  for (int IVAD_SETTING = 0 ; IVAD_SETTING < IVAD_SETTING_END ;  IVAD_SETTING ++ )
   {
     writeToIvad(IVAD_REGISTER_PROPERTY, IVAD_SETTING, CURRENT_CONFIG[IVAD_SETTING]);
   }
+  Serial.print(F("[IVAD] Settings written. I2C errors: "));
+  Serial.println(i2cErrors);
+
 }
 
-/**
- * @brief Store current configuration to EEPROM
- *
- * Computes checksum of current configuration (excluding checksum byte),
- * stores it, then writes all 26 bytes to EEPROMWearLevel storage.
- * This persists settings across power cycles.
- *
- * @note EEPROMWearLevel provides wear-leveling to extend flash lifetime
- * @see settings_load()
- */
+
+
+void printSettingName(byte slot) {
+  switch (slot) {
+    case CONFIG_OFFSET_CONTRAST:          Serial.print(F("contrast        ")); break;
+    case CONFIG_OFFSET_RED_DRIVE:         Serial.print(F("red drive       ")); break;
+    case CONFIG_OFFSET_GREEN_DRIVE:       Serial.print(F("green drive     ")); break;
+    case CONFIG_OFFSET_BLUE_DRIVE:        Serial.print(F("blue drive      ")); break;
+    case CONFIG_OFFSET_RED_CUTOFF:        Serial.print(F("red cutoff      ")); break;
+    case CONFIG_OFFSET_GREEN_CUTOFF:      Serial.print(F("green cutoff    ")); break;
+    case CONFIG_OFFSET_BLUE_CUTOFF:       Serial.print(F("blue cutoff     ")); break;
+    case CONFIG_OFFSET_HORIZONTAL_POS:    Serial.print(F("horiz pos       ")); break;
+    case CONFIG_OFFSET_HEIGHT:            Serial.print(F("height          ")); break;
+    case CONFIG_OFFSET_VERTICAL_POS:      Serial.print(F("vert pos        ")); break;
+    case CONFIG_OFFSET_S_CORRECTION:      Serial.print(F("s-correction    ")); break;
+    case CONFIG_OFFSET_KEYSTONE:          Serial.print(F("keystone        ")); break;
+    case CONFIG_OFFSET_PINCUSHION:        Serial.print(F("pincushion      ")); break;
+    case CONFIG_OFFSET_WIDTH:             Serial.print(F("width           ")); break;
+    case CONFIG_OFFSET_PINCUSHION_BALANCE:Serial.print(F("pinc balance    ")); break;
+    case CONFIG_OFFSET_PARALLELOGRAM:     Serial.print(F("parallelogram   ")); break;
+    case CONFIG_OFFSET_RESERVED6:         Serial.print(F("reserved6       ")); break;
+    case CONFIG_OFFSET_BRIGHTNESS:        Serial.print(F("brightness      ")); break;
+    case CONFIG_OFFSET_ROTATION:          Serial.print(F("rotation        ")); break;
+    case CONFIG_OFFSET_CHECKSUM:          Serial.print(F("checksum        ")); break;
+    default:                              Serial.print(F("unknown         ")); break;
+  }
+}
+
 void settings_store()
 {
 
-  // compute current config checksum and store it.
   byte current_config_checksum = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
-
   CURRENT_CONFIG[CONFIG_OFFSET_CHECKSUM] = current_config_checksum;
 
-  for (byte eeprom_memory_offset = 0; eeprom_memory_offset < CONFIG_EEPROM_SLOTS; eeprom_memory_offset++)
-  {
-    EEPROMwl.update(eeprom_memory_offset, CURRENT_CONFIG[eeprom_memory_offset]);
-  } // end for
+  Serial.println(F("[EEPROM] Saving config..."));
+  for (byte slot = 0 ; slot < CONFIG_EEPROM_SLOTS ; slot++) {
+    byte old_val = EEPROMwl.read(slot);
+    EEPROMwl.update(slot, CURRENT_CONFIG[slot]);
+    Serial.print(F("  ["));
+    if (slot < 10) Serial.print(' ');
+    Serial.print(slot);
+    Serial.print(F("] "));
+    printSettingName(slot);
+    Serial.print(F(": "));
+    Serial.print(CURRENT_CONFIG[slot]);
+    if (old_val != CURRENT_CONFIG[slot]) {
+      Serial.print(F("  (was "));
+      Serial.print(old_val);
+      Serial.print(')');
+    }
+    Serial.println();
+  }
+  Serial.print(F("[EEPROM] Save complete. Checksum: "));
+  Serial.println(current_config_checksum);
+
 }
 
-/**
- * @brief Reset all settings to factory defaults
- *
- * Copies VIDEO_CONFIG_DEFAULT values (21 bytes) into CURRENT_CONFIG[]
- * and computes checksum for the new configuration.
- *
- * @note Does NOT automatically store to EEPROM - call settings_store() after
- * @see VIDEO_CONFIG_DEFAULT in ivad.h for default values
- * @see settings_store()
- */
+
 void settings_reset_default()
 {
 
-  // compute current config checksum and store it.
-  byte current_config_checksum = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
+  Serial.println(F("[EEPROM] Resetting CURRENT_CONFIG to defaults."));
+  for (byte eeprom_memory_offset = 0 ; eeprom_memory_offset < CONFIG_EEPROM_SLOTS ; eeprom_memory_offset++) {
+    CURRENT_CONFIG[eeprom_memory_offset] = VIDEO_CONFIG_DEFAULT[eeprom_memory_offset];
+  }//end for
 
+  byte current_config_checksum = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
   CURRENT_CONFIG[CONFIG_OFFSET_CHECKSUM] = current_config_checksum;
 
-  for (byte eeprom_memory_offset = 0; eeprom_memory_offset < sizeof(VIDEO_CONFIG_DEFAULT); eeprom_memory_offset++)
-  {
-    CURRENT_CONFIG[eeprom_memory_offset] = VIDEO_CONFIG_DEFAULT[eeprom_memory_offset];
-  } // end for
+
+
 }
